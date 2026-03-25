@@ -1,0 +1,68 @@
+# CI/CD & Deployment Workflow Analysis
+
+This document explains how the `sfjapi` code moves from a commit in GitLab to a running service in AWS.
+
+## 1. Overview of the Pipeline
+The workflow is split between **GitLab** (for code quality and testing) and **AWS** (for building and orchestration).
+
+```mermaid
+graph TD
+    A[GitLab Push] --> B(GitLab CI: Test/Lint)
+    B -->|Success| C[AWS CodePipeline Trigger]
+    C --> D(AWS CodeBuild: Docker Build)
+    D --> E[Amazon ECR: Image Push]
+    E --> F(AWS CloudFormation: Update Stack)
+    F --> G[AWS ECS: Rolling Update]
+    G --> H{Health Check}
+    H -->|Pass| I[Deployment Success]
+    H -->|Fail| J[Circuit Breaker: Rollback]
+```
+
+## 2. Detailed Steps
+
+### Step 1: GitLab CI (Validation)
+- **Files**: [.gitlab-ci.yml](file:///c:/Users/myPC/Desktop/dev/job/sfj/sfjapi/.gitlab-ci.yml)
+- **When it runs**: On every push to any branch.
+- **What it does**:
+    - **Python**: Runs `pytest` (unit tests), `ruff` (SAST/Lint), and `mypy` (type checking).
+    - **Node**: Runs `prettier` to check HTML template formatting.
+- **If it fails**: The pipeline stops immediately. You will see a "Failed" status in GitLab. Code cannot be considered "safe" for deployment.
+
+### Step 2: AWS CodePipeline (Orchestration)
+- **Trigger**: Automatic notification via AWS CodeStar Connection when `main` is updated or a `staging` tag is pushed.
+- **What it does**: Orchestrates the transition between Source, Build, and Deploy stages.
+- **If it fails**: The pipeline stops. The production/staging environment remains on the old version.
+
+### Step 3: AWS CodeBuild (Build)
+- **Files**: [sfjapi.dockerfile](file:///c:/Users/myPC/Desktop/dev/job/sfj/sfjapi/sfjapi.dockerfile)
+- **What it does**:
+    - Build a multi-stage Docker image using `python:3.12-alpine`.
+    - Installs dependencies using `uv sync --frozen`.
+    - Tags the image with the Git commit hash and `latest`.
+    - Pushes the image to **Amazon ECR**.
+- **If it fails**: Usually due to dependency conflicts (e.g., [uv.lock](file:///c:/Users/myPC/Desktop/dev/job/sfj/sfjapi/uv.lock) mismatch) or syntax errors. No new image is created.
+
+### Step 4: AWS CloudFormation (Infrastructure as Code)
+- **Files**: [sfj-api-app.yml](file:///c:/Users/myPC/Desktop/dev/job/sfj/sfjapi/devops/cloudformation/sfj-api-app.yml)
+- **What it does**:
+    - Updates the **ECS Task Definition** with the new image URI from ECR.
+    - Triggers the ECS service update.
+- **If it fails**: If the CloudFormation template has errors (e.g., invalid IAM permissions or missing parameters), the stack update will fail and stay on the previous state.
+
+### Step 5: AWS ECS (Deployment & Rollback)
+- **What it does**:
+    - Starts new containers with the updated image.
+    - Waits for them to pass **ALB Health Checks**.
+    - Gradually stops old containers (Rolling Update).
+- **Circuit Breaker**: [sfj-api-app.yml](file:///c:/Users/myPC/Desktop/dev/job/sfj/sfjapi/devops/cloudformation/sfj-api-app.yml) has `DeploymentCircuitBreaker` enabled.
+- **If it fails**: If the new version crashes or fails health checks (e.g., cannot connect to Database), ECS automatically **rolls back** to the last known stable Task Definition.
+
+## 3. Observability (OTel Collector)
+The stack in [sfj-api-otel.yml](file:///c:/Users/myPC/Desktop/dev/job/sfj/sfjapi/devops/cloudformation/sfj-api-otel.yml) deploys an **AWS OTel Collector**.
+- It collects traces and metrics from the application (using the `opentelemetry` libraries seen in [pyproject.toml](file:///c:/Users/myPC/Desktop/dev/job/sfj/sfjapi/pyproject.toml)).
+- Sends data to the endpoint configured in Secrets Manager.
+
+## 4. Summary of Failure Impacts
+- **GitLab CI Fail**: Prevents bad code from reaching AWS. No impact on live environment.
+- **CodeBuild Fail**: Build stops. No new image. Live environment stays as is.
+- **ECS Health Check Fail**: **Automatic Rollback**. The system detects the failure and restores the previous working version automatically.
